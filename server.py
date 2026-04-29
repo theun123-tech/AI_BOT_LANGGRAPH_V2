@@ -1101,7 +1101,38 @@ async def handle_clients_research(request):
         # confuse both the TTS and the Agent.
         synthesized_text = _clean_profile_markdown(synthesized_text)
 
-        # Cap at 300 words
+        # Stage 2.13 + 2.14: structured profile header.
+        # Stage 2.14: drop misleading client-on-call line.
+        # The "Client names" field in the UI is a research pivot — the user
+        # types a public-facing person at the company (e.g. an executive,
+        # founder, or named figure) so SerpAPI can find the RIGHT company
+        # among many with similar names. That person is NOT necessarily on
+        # the call. The actual speaker is whoever joins the meeting in
+        # Recall.ai — a different layer entirely.
+        #
+        # Stage 2.13 wrongly assumed client_names = attendees and added a
+        # "CLIENT(S) ON THE CALL: <client_names>" line. That made Sam
+        # confidently mis-identify the speaker. We removed that line.
+        #
+        # What remains: just the COMPANY: line (clean string Sam can extract)
+        # and a clarifying KEY FACTS line saying the prose is ABOUT THE
+        # COMPANY, not the speaker. Names mentioned IN the prose (founders,
+        # executives, public figures used as research anchors) are explicitly
+        # not assumed to be on the call.
+        header_lines = []
+        if company_names:
+            header_lines.append(f"COMPANY: {company_names}")
+        if header_lines:
+            header_lines.append(
+                "KEY FACTS BELOW (this describes the speaker's company — "
+                "use it to ground your answers about their business. Names "
+                "mentioned in the description, e.g. founders or executives, "
+                "are research references and are NOT necessarily on the call):"
+            )
+            structured_header = "\n".join(header_lines)
+            synthesized_text = structured_header + "\n\n" + synthesized_text
+
+        # Cap at 300 words (after header prepend so total length is bounded)
         words = synthesized_text.split()
         if len(words) > 300:
             synthesized_text = " ".join(words[:300]) + "..."
