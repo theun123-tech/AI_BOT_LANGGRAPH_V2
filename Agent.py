@@ -892,6 +892,188 @@ class MeetingRAG:
         self._entries.clear()
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2.6: ResearchJournal — append-only RAG cache for follow-ups
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ResearchJournal:
+    """Append-only research history with semantic retrieval.
+
+    Replaces Stage 2.5's single-slot _research_cache. Each research turn
+    appends a new entry. Follow-up questions search the journal by embedding
+    similarity (using the same fastembed model MeetingRAG uses).
+
+    Why not just reuse MeetingRAG?
+      MeetingRAG stores raw conversation snippets. ResearchJournal stores
+      structured research bundles (question, answer, fetched tickets, web
+      results, plus type/timestamp for TTL). Different shape, different uses.
+
+    Entry shape:
+      {
+        "fetched_at":         float,          # time.time()
+        "question":           str,            # rewritten search query
+        "raw_question":       str,            # original user text
+        "synthesis_output":   str,            # what Sam said
+        "jira_tickets":       list[dict],     # fresh tickets from research
+        "web_results":        list[dict],     # Exa/Brave results
+        "question_type":      str,            # planner classification
+        "vector":             np.ndarray|None # 384-dim bge embedding
+      }
+    """
+
+    # TTL by question type — drives retrieval ordering when scores are close
+    _TTL_BY_TYPE = {
+        "jira_status":     30,
+        "general":         300,
+        "feasibility":     1800,
+        "tech_switch":     1800,
+        "best_practices":  1800,
+        "internal_org":    3600,
+    }
+
+    def __init__(self, embed_model=None):
+        """embed_model: shared TextEmbedding from MeetingRAG (avoid reload)."""
+        self._entries: list[dict] = []
+        self._model = embed_model
+        self._ready = embed_model is not None
+        if self._ready:
+            print("[Journal] ✅ Research journal ready (sharing MeetingRAG embed model)")
+        else:
+            print("[Journal] ⚠️  No embed model — keyword fallback only")
+
+    def _embed_sync(self, text):
+        if not self._model:
+            return None
+        try:
+            vectors = list(self._model.embed([text]))
+            return np.array(vectors[0], dtype=np.float32)
+        except Exception as e:
+            print(f"[Journal] Embed failed: {e}")
+            return None
+
+    async def add(self, entry: dict):
+        """Append a research entry, embedding the question text in background.
+
+        Non-blocking — the embedding happens in a thread pool. The entry is
+        appended immediately so subsequent searches can find it (initially
+        via keyword fallback until the vector is ready).
+        """
+        import time as _t
+        entry.setdefault("fetched_at", _t.time())
+        entry.setdefault("vector", None)
+
+        # Append immediately so retrieval can find it via keyword if needed
+        self._entries.append(entry)
+
+        # Embed in background — find this same entry in the list and update
+        if self._ready:
+            text_to_embed = entry.get("question") or entry.get("raw_question") or ""
+            if not text_to_embed.strip():
+                return
+            try:
+                loop = asyncio.get_event_loop()
+                vector = await loop.run_in_executor(
+                    None, self._embed_sync, text_to_embed
+                )
+                entry["vector"] = vector
+            except Exception as e:
+                print(f"[Journal] Background embed failed: {e}")
+
+        print(f"[Journal] 📔 Entry #{len(self._entries)} added: "
+              f"q='{entry.get('question', '')[:50]}', "
+              f"type={entry.get('question_type', '?')}, "
+              f"tickets={len(entry.get('jira_tickets', []))}, "
+              f"web={len(entry.get('web_results', []))}")
+
+    async def search(self, query: str, top_k: int = 1, min_score: float = 0.5):
+        """Find the most relevant journal entry for the rewritten query.
+
+        Returns: list of (score, entry) tuples, top_k highest-scoring entries
+                 with score >= min_score. Empty list if no matches.
+
+        Uses cosine similarity on embeddings. Falls back to keyword matching
+        if embedding fails or vectors aren't ready yet.
+
+        min_score guards against low-similarity false positives. 0.5 is
+        conservative for bge-small-en-v1.5 (384-dim).
+        """
+        if not self._entries:
+            return []
+
+        # Vector path
+        if self._ready and self._model:
+            try:
+                loop = asyncio.get_event_loop()
+                query_vec = await loop.run_in_executor(
+                    None, self._embed_sync, query
+                )
+                if query_vec is not None:
+                    scored = []
+                    for entry in self._entries:
+                        ev = entry.get("vector")
+                        if ev is None:
+                            continue
+                        sim = self._cosine_sim(query_vec, ev)
+                        scored.append((sim, entry))
+
+                    if scored:
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        results = [(s, e) for s, e in scored[:top_k] if s >= min_score]
+                        if results:
+                            print(f"[Journal] 🎯 Vector search: top score {results[0][0]:.3f} "
+                                  f"({len(results)} hits >= {min_score})")
+                            return results
+                        # Log near-misses so we can tune min_score
+                        if scored:
+                            print(f"[Journal] ⚠️  Best score {scored[0][0]:.3f} below "
+                                  f"min_score {min_score} — treating as miss")
+            except Exception as e:
+                print(f"[Journal] Vector search error: {e}")
+
+        # Keyword fallback (when no vectors ready or embedding broke)
+        return self._keyword_search(query, top_k)
+
+    def _keyword_search(self, query: str, top_k: int = 1):
+        """Fallback when vectors unavailable — score by keyword overlap."""
+        STOP = {"the", "a", "an", "is", "are", "was", "were", "what", "who",
+                "how", "when", "where", "why", "did", "do", "does", "tell",
+                "me", "more", "about", "of", "in", "on", "at", "to", "for"}
+        qwords = {w.lower() for w in query.split() if len(w) > 2 and w.lower() not in STOP}
+        if not qwords:
+            return []
+        scored = []
+        for entry in self._entries:
+            text = (
+                (entry.get("question") or "") + " " +
+                (entry.get("raw_question") or "") + " " +
+                (entry.get("synthesis_output") or "")
+            ).lower()
+            hits = sum(1 for w in qwords if w in text)
+            if hits > 0:
+                # Normalize to a [0,1] score for consistent thresholding
+                score = min(1.0, hits / max(len(qwords), 1))
+                scored.append((score, entry))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            print(f"[Journal] 🔤 Keyword fallback: top score {scored[0][0]:.2f}")
+            return scored[:top_k]
+        return []
+
+    @staticmethod
+    def _cosine_sim(a, b):
+        dot = np.dot(a, b)
+        norm = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(dot / norm) if norm > 0 else 0.0
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    def clear(self):
+        self._entries.clear()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1126,7 +1308,7 @@ Field rules:
   - "internal_org" = questions about the COMPANY, TEAM, PEOPLE, or INTERNAL STRUCTURE. Examples: "who is our CEO", "how many employees do we have", "what's our office address", "who's on the team", "what's our company policy", "who runs engineering", "what do we do as a company". Anything that asks about private/internal company facts that wouldn't be on the public web reliably.
   - "general" = anything else needing research (news, facts, public knowledge)
 - "relevant_cached_tickets": List ticket keys from the cache above that relate to this question. Max 5. Empty list if none relate.
-- "needs_fresh_jira": true ONLY if the question mentions concepts/features not covered by any cached ticket (the cache might be missing relevant work). Default false. For internal_org questions, set to false.
+- "needs_fresh_jira": Stage 2.11: LLM freshness judgment (no keywords). Set true when the question is asking about the PRESENT STATE of tickets — current status, who is assigned, what is blocked, what has changed, what is now in progress, what should be worried about today, who is working on what, anything that depends on the latest state of work. Set true even if the cache contains the relevant ticket — if the user is asking about its current state, fresh data is needed. Set false only when the question is about historical context, ticket definitions, or static information that does NOT depend on current data (e.g., "what was SCRUM-244 about" referring to its description). For internal_org questions, set to false.
 - "jira_search_terms": Short phrase (2-5 words) for a Jira text search. Only populated if needs_fresh_jira is true.
 - "web_search_query": A clean Google search query. For jira_status and internal_org questions, output exactly "SKIP".
 - "serpapi_context_features": Natural-language descriptions of project features relevant to this question (no ticket IDs). Max 6 items. Derived from cached tickets + conversation. Empty list for jira_status and internal_org questions.
@@ -1136,43 +1318,216 @@ CRITICAL: When in doubt about whether a question is about the COMPANY/TEAM/PEOPL
 Output ONLY the JSON object. No markdown, no explanation, no code fences."""
 
 
-# SerpAPI-direct persona prompt: builds the actual query sent to Google AI Mode.
-# Proven through testing to return TTS-ready responses when TTS hint is included.
-SERPAPI_DIRECT_PROMPT = """I'm a senior developer at AnavClouds Software Solutions in a live client meeting. Client asked: "{question}"
+# ── Stage 2.6: query rewriter ──────────────────────────────────────────────
+# Rewrites vague follow-up questions into self-contained search queries.
+# Resolves pronouns and "the X" against the last 5 turns of conversation.
+# Runs in parallel with EOT + addressee decider — wall-clock cost ~zero.
+QUERY_REWRITER_PROMPT = """You are a query rewriter for a meeting assistant. Your job is to make follow-up questions self-contained so they can be searched against past research.
 
-Our project context:
-{project_context}
+Recent conversation (most recent last):
+{conversation}
 
-{conversation_hint}Answer {length} for TTS, clean sentences. No citations, no markdown, no bullet points, no source references. Speak naturally like telling this to a client in real-time.
+Current user question: "{question}"
 
-Always use your trusted web sources for any specific facts about companies, people, products, or technologies. If you cannot verify a specific fact from trusted sources, say so plainly rather than guessing. STRICTLY make sure to word limit MAX 3-4 sentences dont exceed 60 words. Be concise, clear, and client-friendly in your tone."""
-
-
-# Dynamic filler prompt: generates ONE sentence of contextual acknowledgment.
-# Runs in parallel with router/trigger decisions. 400ms timeout.
-FILLER_PROMPT = """You are Sam, a senior PM on a live voice call. Someone just asked you a question that needs a quick research lookup. Generate ONE SHORT filler sentence to say BEFORE looking up the answer.
+Rewrite the question so it stands alone. Resolve pronouns ("him", "her", "it", "that") and vague references ("the president", "that ticket", "the same thing") using the conversation above. If the question is already self-contained, return it unchanged.
 
 Rules:
-- ONE sentence, 8 to 18 words
-- Acknowledge the topic naturally (do NOT answer the question)
-- Sound like a real person pausing to check
-- Use words like "let me", "one sec", "checking", "hmm", "yeah"
-- Do NOT commit to any facts
+- Output ONLY the rewritten question, nothing else
+- Keep it ONE sentence
+- Keep it short — under 25 words
+- If you can't resolve a reference, leave it as-is rather than guessing
+- Don't add information that wasn't in the conversation
+
+Rewritten question:"""
+
+
+# Stage 2.5: fast-PM prompt for cache-hit follow-ups.
+# Used by _fast_pm_with_research_cache to answer follow-up questions from
+# cached research context without re-fetching. If the cache cannot answer,
+# the model is instructed to respond with the single word "ESCALATE", which
+# cancels the fast path and falls through to a fresh research turn.
+FAST_PM_CACHED_PROMPT = """You are Sam, a senior PM at AnavClouds Software Solutions, on a live voice call with a client. The user is asking a follow-up question that builds on what was just discussed. You have cached context from the previous research turn — use it to answer fast.
+
+══════════════════════════════════════════════════════════════
+CLIENT PROFILE (always authoritative for names and company facts):
+{client_profile_block}
+
+══════════════════════════════════════════════════════════════
+MEETING AGENDA:
+{agenda_block}
+
+══════════════════════════════════════════════════════════════
+CACHED PROJECT CONTEXT (from research {cache_age_sec} seconds ago):
+{cached_tickets}
+
+══════════════════════════════════════════════════════════════
+CACHED WEB RESEARCH (retrieved {cache_age_sec} seconds ago):
+{cached_web}
+
+══════════════════════════════════════════════════════════════
+YOUR PRIOR RESPONSE (the last thing you said in this conversation):
+{cached_synthesis}
+
+══════════════════════════════════════════════════════════════
+CURRENT CONVERSATION (most recent turns):
+{conversation_block}
+
+══════════════════════════════════════════════════════════════
+CLIENT JUST ASKED:
+"{question}"
+
+══════════════════════════════════════════════════════════════
+HOW TO ANSWER:
+
+The cached context above is from THIS conversation, just moments ago. The user is almost certainly asking a follow-up that builds on it.
+
+1. If the cached context contains what you need to answer, respond naturally and conversationally — 2 to 4 sentences, 30 to 60 words. Speak like a senior PM mid-conversation. No bullet points, no markdown, no source citations.
+
+2. For NAMES: only use names from the CLIENT PROFILE section. Do not invent names. Do not use placeholder names.
+
+3. Reference cached tickets by ID where relevant (e.g. "SCRUM-244 is still in progress").
+
+4. You can build on your prior response naturally ("As I mentioned, ...", "right, the same one we just talked about").
+
+5. Be confident. The cached context is fresh and authoritative.
+
+══════════════════════════════════════════════════════════════
+ESCAPE HATCH — when to ESCALATE:
+
+If the cached context CANNOT answer this question — for example:
+  - The user is asking about a NEW ticket that's not in the cache
+  - The user shifted to a totally NEW topic outside what was researched
+  - The user is asking for fresh facts that the cache doesn't have
+
+Then respond with EXACTLY this single word and nothing else:
+
+ESCALATE
+
+When in doubt, prefer ESCALATE — a fresh research turn is much better than guessing or making something up. Do not write "ESCALATE because..." or "I should escalate" — just the word ESCALATE on its own.
+
+══════════════════════════════════════════════════════════════
+YOUR RESPONSE:"""
+
+RESEARCH_SYNTHESIS_PROMPT = """You are Sam, a senior developer and PM at AnavClouds Software Solutions, on a live voice call with a client. Below is the context for the call. Use it to answer the client's question naturally and conversationally.
+ 
+══════════════════════════════════════════════════════════════
+LIVE JIRA TICKETS (authoritative — use as ground truth):
+{project_context}
+ 
+══════════════════════════════════════════════════════════════
+MEETING AGENDA (today's topics, in order):
+{agenda_block}
+ 
+══════════════════════════════════════════════════════════════
+CLIENT PROFILE:
+{client_profile_block}
+ 
+══════════════════════════════════════════════════════════════
+WEB SEARCH RESULTS (fresh from authoritative sources, just retrieved):
+{web_search_results}
+ 
+══════════════════════════════════════════════════════════════
+CONVERSATION SO FAR (most recent turns):
+{conversation_block}
+ 
+══════════════════════════════════════════════════════════════
+CLIENT JUST ASKED:
+"{question}"
+ 
+══════════════════════════════════════════════════════════════
+HOW TO ANSWER:
+ 
+Treat the LIVE JIRA TICKETS section as the authoritative source of truth about the project. Do NOT invent ticket statuses, priorities, or details that aren't there. If asked about something specific that isn't in the tickets, say so plainly — "I don't see that in our current tickets" — rather than guessing.
+ 
+For the AGENDA, only use the items listed above. Do not infer the agenda from tickets — if asked about today's agenda, list ONLY what's in the AGENDA section. If the agenda section is empty, say "we don't have a fixed agenda for today" rather than fabricating one.
+ 
+For NAMES: Only use names that appear in the CLIENT PROFILE "ON THIS CALL" section. Do NOT make up names. Do NOT use names from the LIVE JIRA TICKETS section as if they're on the call (those are people referenced in tickets, not call participants). Do NOT use placeholder names like "Rachel", "Mike", "John". If the CLIENT PROFILE section says no one is loaded, just speak naturally without addressing anyone by name.
+ 
+For the WEB SEARCH RESULTS, treat them as fresh, authoritative reference material that was just retrieved from real sources (websites, articles, official docs). Use them to ground factual or technical answers. NEVER cite URLs, source names, or "according to..." out loud — just speak the information naturally as if you know it. Do not say "the website mentions..." or "based on what I found...".
+ 
+For general technical or industry questions (best practices, comparisons, current events, public facts), ground your answer in the WEB SEARCH RESULTS above. For anything specific to AnavClouds or this client's work, use the LIVE JIRA TICKETS and CLIENT PROFILE first, supplement with web context if it adds value.
+ 
+If the WEB SEARCH RESULTS don't contain the answer (or weren't relevant), say briefly that you don't have specific info on that and offer to follow up — don't invent specifics.
+ 
+Speak naturally — like a senior PM thinking out loud to a client in real time. Use a warm, conversational tone. Small phrases like "yeah", "so", "the way I see it", "honestly", "what we're seeing here" feel natural and human. Don't be robotic, don't use bullet points, don't cite sources, don't reference URLs, don't use markdown.
+ 
+Aim for {length} (around 70-90 words across 4-5 sentences). Acknowledge the question briefly, give the substance with warmth, and end with a natural close — a thought, a small implication, or a soft handoff. Don't always end with a question; vary how you close.
+ 
+If you genuinely don't have enough info to answer, say so honestly and briefly — "I'm not sure about that one specifically, want me to check after the call?" — rather than making things up.
+"""
+
+# SerpAPI-direct persona prompt: builds the actual query sent to Google AI Mode.
+# Proven through testing to return TTS-ready responses when TTS hint is included.
+SERPAPI_DIRECT_PROMPT = """You are Sam, a senior developer and PM at AnavClouds Software Solutions, on a live voice call with a client. Below is the context for the call. Use it to answer the client's question naturally and conversationally.
+
+══════════════════════════════════════════════════════════════
+LIVE JIRA TICKETS (authoritative — use as ground truth):
+{project_context}
+
+══════════════════════════════════════════════════════════════
+MEETING AGENDA (today's topics, in order):
+{agenda_block}
+
+══════════════════════════════════════════════════════════════
+CLIENT PROFILE:
+{client_profile_block}
+
+══════════════════════════════════════════════════════════════
+CONVERSATION SO FAR (most recent turns):
+{conversation_block}
+
+══════════════════════════════════════════════════════════════
+CLIENT JUST ASKED:
+"{question}"
+
+══════════════════════════════════════════════════════════════
+HOW TO ANSWER:
+
+Treat the LIVE JIRA TICKETS section as the authoritative source of truth about the project. Do NOT invent ticket statuses, priorities, or details that aren't there. If asked about something specific that isn't in the tickets, say so plainly — "I don't see that in our current tickets" — rather than guessing.
+
+For the AGENDA, only use the items listed above. Do not infer the agenda from tickets — if asked about today's agenda, list ONLY what's in the AGENDA section. If the agenda section is empty, say "we don't have a fixed agenda for today" rather than fabricating one.
+
+For NAMES: Only use names that appear in the CLIENT PROFILE "ON THIS CALL" section. Do NOT make up names. Do NOT use names from the LIVE JIRA TICKETS section as if they're on the call (those are people referenced in tickets, not call participants). Do NOT use placeholder names like "Rachel", "Mike", "John". If the CLIENT PROFILE section says no one is loaded, just speak naturally without addressing anyone by name.
+
+For general technical or industry questions (best practices, comparisons, current events, public facts), use your trusted web sources. For anything specific to AnavClouds or this client's work, stick to what's in the context above.
+
+Speak naturally — like a senior PM thinking out loud to a client in real time. Use a warm, conversational tone. Small phrases like "yeah", "so", "the way I see it", "honestly", "what we're seeing here" feel natural and human. Don't be robotic, don't use bullet points, don't cite sources, don't reference URLs, don't use markdown.
+
+Aim for {length} (around 70-90 words across 4-5 sentences). Acknowledge the question briefly, give the substance with warmth, and end with a natural close — a thought, a small implication, or a soft handoff. Don't always end with a question; vary how you close.
+
+If you genuinely don't have enough info to answer, say so honestly and briefly — "I'm not sure about that one specifically, want me to check after the call?" — rather than making things up."""
+
+
+# Dynamic filler prompt: generates a longer, contextual acknowledgment that
+# matches the 7-second hardcoded fillers in length (3-4 sentences, 30-50 words).
+# Runs in parallel with router/trigger decisions. 1500ms timeout (Groq 70b).
+FILLER_PROMPT = """You are Sam, a senior PM on a live voice call. Someone just asked you a question that needs a quick research lookup. Generate a warm 3-4 sentence filler to say BEFORE looking up the answer. The filler should cover ~7 seconds of speech to give the research pipeline time to complete.
+
+Rules:
+- 3 to 4 sentences, 30 to 50 words total
+- Pattern: ACKNOWLEDGE the topic → THINKING action → SOFT CLOSE
+- Sound like a real person pausing to think, not a recording
+- Use natural phrases: "yeah", "hmm", "one sec", "let me", "give me a moment", "I want to make sure"
+- Reference the topic VAGUELY (don't commit to specific facts you'd need to verify)
 - No meta-commentary ("as an AI", "sure, here's")
+- No bullet points, no markdown, just conversational prose
 
 Examples:
-Question: "Can we migrate to PostgreSQL?"
-Filler: "Yeah let me check what moving to Postgres would involve for our setup."
+Question: "Can we migrate from MongoDB to PostgreSQL?"
+Filler: "Hmm, that's a good one. Let me pull up what we have on the data setup before I commit to anything specific. I want to make sure I'm giving you accurate info on the migration tradeoffs, give me just a sec."
 
 Question: "What's the status of SCRUM-31?"
-Filler: "One sec, pulling up SCRUM-31 to see where it's at."
+Filler: "Yeah, let me grab the latest on SCRUM-31 for you — I want to check if there's been any movement on it recently. One moment while I pull that up properly, won't take too long."
 
 Question: "How's the sprint going?"
-Filler: "Let me check the sprint board real quick and give you the rundown."
+Filler: "Right, let me look at the sprint board real quick and pull together where we stand. I want to give you a solid picture rather than a half-answer, so just give me a moment to check the latest."
+
+Question: "Best practices for OTP authentication?"
+Filler: "Honestly, good question — let me think through what's been working well in the field and what fits our setup specifically. Give me just a second to pull together the relevant pieces before I jump in."
 
 Now generate a filler for: "{question}"
 
-Output ONLY the filler sentence. No quotes, no explanation, no prefix."""
+Output ONLY the filler text. No quotes, no explanation, no prefix."""
 
 
 # Longer warm fillers (~4-5s each at TTS pace, 12-18 words) — buy real time
@@ -1185,18 +1540,18 @@ Output ONLY the filler sentence. No quotes, no explanation, no prefix."""
 # left awkward dead air for the remaining 5-7s. These cover the realistic
 # end-to-end research latency for typical questions.
 FILLERS = [
-    "Hmm, good question — let me pull up what I know about that for you, one sec.",
-    "Yeah, give me a second to dig into that. I want to make sure I get it right for you.",
-    "Right, let me grab the latest on that — won't take long, just want to be accurate.",
-    "Okay, hold on a moment while I look that up properly. Want to give you a solid answer.",
-    "Honestly, let me pull the current data on that real quick before I respond.",
-    "One sec, I'm checking the most recent info on this so you get the right answer.",
-    "Sure, let me look into that for you — I want to make sure what I tell you is accurate.",
-    "Good one — give me a moment to check the latest details on that before I jump in.",
-    "Let me see what I can find on that for you. Just a sec, want to get this right.",
-    "Yeah, hang on a second. I'm grabbing the most up-to-date info on that for you.",
-    "Alright, one moment while I pull that up. I'd rather be accurate than fast here.",
-    "Hmm, let me check on that properly — give me just a second to get you the right answer.",
+    "Hmm, good question — let me pull up what I know about that for you, give me just a moment to get it right.",
+    "Yeah, give me a second to dig into that. I want to make sure I'm giving you the most accurate picture I can.",
+    "Right, let me grab the latest on that — won't take too long, just want to be sure I'm giving you good info.",
+    "Okay, hold on a moment while I look that up properly. I want to give you a solid answer here, give me just a sec.",
+    "Honestly, let me pull the current data on that real quick before I respond — I'd rather be accurate than fast.",
+    "One sec, I'm checking the most recent info on this so you get the right answer. Just a moment, won't take long.",
+    "Sure, let me look into that for you — I want to make sure what I tell you is accurate and current. One moment.",
+    "Good one — give me a moment to check the latest details on that before I jump in with anything. Just a second.",
+    "Let me see what I can find on that for you. Just a sec, want to get this right and pull together what's relevant.",
+    "Yeah, hang on a second. I'm grabbing the most up-to-date info on that for you, want to give you the full picture.",
+    "Alright, one moment while I pull that up. I'd rather be accurate than fast here, so just hang tight a sec.",
+    "Hmm, let me check on that properly — give me just a second or two to get you the right answer on this one.",
 ]
 
 
@@ -1267,13 +1622,27 @@ class PMAgent:
         # RAG store — embeds + retrieves meeting exchanges
         self.rag = MeetingRAG()
 
+        # Stage 2.6: research journal — separate from conversation RAG.
+        # Stores research entries (question + answer + fetched data) and
+        # supports semantic retrieval for follow-up questions.
+        # Shares the embed model with self.rag to avoid loading bge twice.
+        self.journal = ResearchJournal(
+            embed_model=getattr(self.rag, "_model", None)
+        )
+
     def start(self):
         """Call once after event loop is running to start background embedder + warmup."""
         self.rag.start_background_embedder()
         asyncio.create_task(self._warmup())
 
     async def _warmup(self):
-        """Pre-establish TCP connection to Groq — saves ~300ms on first real call."""
+        """Pre-establish TCP connection to Groq — saves ~300ms on first real call.
+
+        Stage 2.9: also pre-warms the rewriter (which uses llama-3.1-8b-instant,
+        a different model than self.model). Without this, the FIRST rewriter
+        call in a session takes ~1100ms (TLS + cold model), often timing out.
+        After warmup it consistently runs in 200-700ms.
+        """
         try:
             await self.client.chat.completions.create(
                 model=self.model,
@@ -1284,11 +1653,278 @@ class PMAgent:
         except Exception:
             pass
 
+        # Stage 2.9: pre-warm the rewriter model (llama-3.1-8b-instant).
+        # Fire-and-forget — failure here is non-fatal, runtime still works.
+        try:
+            await self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            print("[Agent] ✅ Rewriter model warmed up (llama-3.1-8b-instant)")
+        except Exception as e:
+            print(f"[Agent] ⚠️  Rewriter warmup failed (non-fatal): "
+                  f"{type(e).__name__}")
+
     def _get_web_search(self):
         if not hasattr(self, '_web_search') or self._web_search is None:
             from external_apis import WebSearch
             self._web_search = WebSearch()
         return self._web_search
+    
+    def _get_exa_search(self):
+        """Lazily instantiate ExaSearch singleton on first use.
+ 
+        Mirrors the _get_web_search() pattern. Stays None until first called,
+        so sessions that never use Exa don't pay the construction cost.
+        """
+        if not hasattr(self, "_exa_search") or self._exa_search is None:
+            from external_apis import ExaSearch
+            self._exa_search = ExaSearch()
+        return self._exa_search
+    
+    
+    async def exa_stream_synthesis_to_queue(
+        self,
+        user_text: str,
+        exa_results: list,
+        project_context: str,
+        azure_extractor,
+        queue,  # asyncio.Queue
+        conversation: str = "",
+        agenda_block: str = "",
+        client_profile_block: str = "",
+        length: str = "70-90 words",
+    ):
+        """Stream Azure-synthesized research answer to a TTS queue, using Exa results.
+ 
+        This is the Exa equivalent of serpapi_direct_research() — but instead of
+        sending a long persona prompt to Brave AI Mode and getting back a single
+        string, we:
+          1. Pass Exa's structured search results to Azure
+          2. Azure does the synthesis (with full project/agenda/profile context)
+          3. Sentences stream into the queue as Azure produces them
+ 
+        Same TTS-friendly sentence chunking as stream_research_to_queue().
+        Same caller pattern: caller awaits the queue via _stream_pipelined().
+ 
+        Args:
+          user_text: the client's question (verbatim, after STT)
+          exa_results: list of {title, url, content, published_date, score} from
+                       ExaSearch.search()
+          project_context: bullet-list of relevant tickets (may be enriched
+                           with fresh Jira data — done at the call site)
+          azure_extractor: the AzureExtractor instance (for endpoint/key reuse)
+          queue: asyncio.Queue to push sentences into (push None when done)
+          conversation: recent conversation turns (last 3 used)
+          agenda_block: today's meeting agenda (formatted by caller)
+          client_profile_block: client/company info (formatted by caller)
+          length: target length hint, default "70-90 words"
+ 
+        Behavior on failure:
+          Pushes a one-line apology + None to the queue (matches stream_research
+          _to_queue behavior). Does NOT raise — caller can keep streaming.
+        """
+        # Local imports — defensive, in case top-of-file imports differ
+        import time as _t
+        import json as _json
+        import httpx as _httpx
+ 
+        t0 = _t.time()
+ 
+        # ── Format Exa results into a labeled WEB SEARCH RESULTS block ──
+        if not exa_results:
+            web_results_text = "(no web results available — search returned nothing usable)"
+        else:
+            lines = []
+            for i, r in enumerate(exa_results[:8], 1):
+                title = (r.get("title") or "").strip()
+                content = (r.get("content") or "").strip()
+                published = (r.get("published_date") or "").strip()
+                if not content:
+                    continue
+                line = f"[{i}]"
+                if title:
+                    line += f" {title}"
+                if published:
+                    line += f" ({published})"
+                line += f":\n{content}"
+                lines.append(line)
+            web_results_text = "\n\n".join(lines) if lines else "(no usable web results)"
+ 
+        # ── Conversation block — last 3 turns, one per line ──
+        if conversation:
+            conv_lines = [
+                l for l in conversation.strip().split("\n") if l.strip()
+            ][-3:]
+            conversation_block = "\n".join(conv_lines) if conv_lines else "(start of call)"
+        else:
+            conversation_block = "(start of call)"
+ 
+        # ── Defaults so prompt sections never render blank ──
+        if not project_context:
+            project_context = "- (no specific project context available)"
+        if not agenda_block:
+            agenda_block = "(no fixed agenda for today)"
+        if not client_profile_block:
+            client_profile_block = "(no client profile loaded)"
+ 
+        # ── Build the full system prompt ──
+        system = RESEARCH_SYNTHESIS_PROMPT.format(
+            question=user_text,
+            project_context=project_context,
+            agenda_block=agenda_block,
+            client_profile_block=client_profile_block,
+            web_search_results=web_results_text,
+            conversation_block=conversation_block,
+            length=length,
+        )
+ 
+        print(f"[Agent] 🔬 Exa synthesis prompt: "
+              f"{len(system)} chars (web_results={len(web_results_text)} chars, "
+              f"context={len(project_context)} chars)")
+ 
+        # ── Path A: Azure unavailable → Groq fallback (matches stream_research_to_queue) ──
+        if not azure_extractor or not azure_extractor.enabled:
+            print("[Agent] ⚠️  Azure unavailable for Exa synthesis — falling back to Groq")
+            try:
+                stream = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_text},
+                    ],
+                    temperature=0.7,
+                    max_tokens=200,
+                    stream=True,
+                )
+                buffer = ""
+                full = ""
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content if chunk.choices else None
+                    if not token:
+                        continue
+                    buffer += token
+                    full += token
+                    while ". " in buffer or "? " in buffer or "! " in buffer:
+                        for sep in [". ", "? ", "! "]:
+                            idx = buffer.find(sep)
+                            if idx != -1:
+                                sentence = buffer[: idx + 1].strip()
+                                buffer = buffer[idx + 2:]
+                                if sentence:
+                                    cleaned = self._clean_serpapi_for_tts(sentence)
+                                    if cleaned:
+                                        await queue.put(cleaned)
+                                break
+                if buffer.strip():
+                    cleaned = self._clean_serpapi_for_tts(buffer.strip())
+                    if cleaned:
+                        await queue.put(cleaned)
+                self.history.append({"role": "assistant", "content": full})
+            except Exception as e:
+                print(f"[Agent] ⚠️  Groq fallback failed: {e}")
+                await queue.put("Sorry, I couldn't process that right now.")
+            await queue.put(None)
+            return
+ 
+        # ── Path B: Azure GPT-4o mini streaming (the happy path) ──
+        self.history.append({"role": "user", "content": user_text})
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
+ 
+        url = (
+            f"{azure_extractor.endpoint}/openai/deployments/"
+            f"{azure_extractor.deployment}/chat/completions"
+            f"?api-version={azure_extractor.api_version}"
+        )
+ 
+        try:
+            async with _httpx.AsyncClient(timeout=60) as client:
+                async with client.stream(
+                    "POST",
+                    url,
+                    headers={
+                        "api-key": azure_extractor.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_text},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 250,
+                        "stream": True,
+                    },
+                ) as response:
+                    response.raise_for_status()
+ 
+                    buffer = ""
+                    full_response = ""
+                    first_token = False
+                    sentence_count = 0
+ 
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = _json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            token = delta.get("content", "")
+                            if not token:
+                                continue
+ 
+                            if not first_token:
+                                first_token = True
+                                ttfs_ms = (_t.time() - t0) * 1000
+                                print(f"[Agent] ⏱ EXA-SYNTH first token (TTFT): "
+                                      f"{ttfs_ms:.0f}ms")
+ 
+                            buffer += token
+                            full_response += token
+ 
+                            while ". " in buffer or "? " in buffer or "! " in buffer:
+                                for sep in [". ", "? ", "! "]:
+                                    idx = buffer.find(sep)
+                                    if idx != -1:
+                                        sentence = buffer[: idx + 1].strip()
+                                        buffer = buffer[idx + 2:]
+                                        if sentence:
+                                            sentence_count += 1
+                                            sent_ms = (_t.time() - t0) * 1000
+                                            print(f"[Agent] ⏱ EXA-SYNTH sentence "
+                                                  f"{sentence_count}: {sent_ms:.0f}ms")
+                                            # Apply same TTS cleanup as Brave path
+                                            cleaned = self._clean_serpapi_for_tts(sentence)
+                                            if cleaned:
+                                                await queue.put(cleaned)
+                                        break
+                        except (_json.JSONDecodeError, IndexError, KeyError):
+                            continue
+ 
+                    if buffer.strip():
+                        sentence_count += 1
+                        cleaned = self._clean_serpapi_for_tts(buffer.strip())
+                        if cleaned:
+                            await queue.put(cleaned)
+ 
+                    total_ms = (_t.time() - t0) * 1000
+                    words = len(full_response.split())
+                    print(f"[Agent] ⏱ EXA-SYNTH total: {total_ms:.0f}ms "
+                          f"({words} words, {sentence_count} sentences)")
+                    self.history.append({"role": "assistant", "content": full_response})
+ 
+        except Exception as e:
+            print(f"[Agent] ❌ Exa synthesis Azure stream failed: "
+                  f"{type(e).__name__}: {e}")
+            await queue.put("Sorry, I ran into an issue researching that.")
+ 
+        await queue.put(None)
+        
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
@@ -1391,13 +2027,27 @@ class PMAgent:
                 )
 
         if cp:
+            # Stage 2.12: explicit speaker-to-profile binding.
+            # Old heading framed the profile as "reference material" with no
+            # connection to the speaker. New heading tells Sam: the people on
+            # this call work at this company. Use the profile to answer
+            # personal questions (my company / our CEO / our work) directly,
+            # do not go to the web for things the profile already covers.
             chunks.append(
-                "COMPANY BACKGROUND (reference material about the client's "
-                "business — use this to understand their work and ground "
-                "your answers in their actual business. IMPORTANT: names "
-                "mentioned here are NOT necessarily on this call — never "
-                "address the current speaker by a name from this section. "
-                "Weave context in naturally; never recite verbatim):\n" + cp
+                "CLIENT YOU\'RE MEETING WITH "
+                "(the person(s) on this call work at the company described "
+                "below — this is authoritative info about who they are and "
+                "what their company does. When they ask \"my company\", "
+                "\"our team\", \"the CEO\", \"our work\", \"my industry\" — "
+                "the answer is in THIS profile. Do NOT search the web for "
+                "personal questions about the speaker\'s company; ground your "
+                "response in this profile and answer directly. Use this "
+                "context to make every recommendation specific to their "
+                "actual business, products, and challenges. IMPORTANT: any "
+                "names mentioned IN this background (founders, executives, "
+                "advisors) are usually NOT on the call — only address the "
+                "current speaker by the names listed under PEOPLE ON THIS "
+                "CALL. Weave context in naturally; never recite verbatim):\n" + cp
             )
 
         return "\n\n".join(chunks)
@@ -1455,14 +2105,23 @@ class PMAgent:
         # speaking. Capped at ~300 words by the UI.
         client_profile = (state.get("client_profile") or "").strip()
         if client_profile:
+            # Stage 2.12: explicit speaker-to-profile binding.
             lines.append(
-                "COMPANY BACKGROUND (reference material about the client's "
-                "business — use this to understand their work and ground "
-                "your responses in their actual business context. IMPORTANT: "
-                "names mentioned in this background are NOT necessarily on "
-                "this call — never address the current speaker by a name "
-                "from this section. Weave business context in naturally; "
-                "never recite verbatim):"
+                "CLIENT YOU\'RE MEETING WITH "
+                "(the person(s) on this call work at the company described "
+                "below — this is authoritative info about who they are and "
+                "what their company does. When they ask \"my company\", "
+                "\"our team\", \"the CEO\", \"our work\", \"my industry\" — "
+                "the answer is in THIS profile. Do NOT search the web for "
+                "personal questions about the speaker\'s company; ground "
+                "your response in this profile and answer directly. Use "
+                "this context to make every recommendation specific to "
+                "their actual business, products, and challenges. "
+                "IMPORTANT: any names mentioned IN this background "
+                "(founders, executives, advisors) are usually NOT on the "
+                "call — only address the current speaker by the names "
+                "listed under PEOPLE ON THIS CALL. Weave business context "
+                "in naturally; never recite verbatim):"
             )
             lines.append(client_profile)
             lines.append("")
@@ -2009,7 +2668,8 @@ class PMAgent:
 
     async def generate_unified_research_plan(self, user_text: str, context: str,
                                               ticket_cache: list,
-                                              memory_header: str = "") -> Optional[dict]:
+                                              memory_header: str = "",
+                                              rewritten_query: str = "") -> Optional[dict]:
         """Single Groq call that outputs a JSON research plan.
 
         The plan tells the caller:
@@ -2039,8 +2699,19 @@ class PMAgent:
 
         previews = self._get_ticket_previews_for_llm(ticket_cache, max_tickets=30)
 
+        # Stage 2.7: if a rewritten (entity-resolved) form of the question is
+        # available, use it as the user_text the planner classifies against.
+        # The original (vague) form stays in the conversation history for
+        # context. This gives the planner the strongest signal for both
+        # question_type classification AND web_search_query generation.
+        effective_user_text = user_text
+        if rewritten_query and rewritten_query.strip() and rewritten_query.strip().lower() != user_text.strip().lower():
+            effective_user_text = (
+                f"{user_text}\n[Resolved entities for search: {rewritten_query.strip()}]"
+            )
+
         prompt = UNIFIED_RESEARCH_PROMPT.format(
-            user_text=user_text,
+            user_text=effective_user_text,
             conversation=conv,
             ticket_previews=previews,
         )
@@ -2115,38 +2786,64 @@ class PMAgent:
 
     async def serpapi_direct_research(self, user_text: str, project_context: str,
                                         conversation: str = "",
-                                        length: str = "2-3 sentences") -> Optional[str]:
-        """Direct SerpAPI call with persona + project context + TTS hint.
+                                        length: str = "70-90 words",
+                                        agenda_block: str = "",
+                                        client_profile_block: str = "") -> Optional[str]:
+        """Direct SerpAPI call with structured persona prompt (Door #1 / Brave AI Mode).
 
-        Returns cleaned voice-ready text or None on failure. Uses search_raw()
-        to bypass query trimming (the persona prompt is long by design).
+        Sends a labeled-section prompt to Brave AI Mode containing:
+          - LIVE JIRA TICKETS (authoritative ground truth)
+          - MEETING AGENDA (today's actual topics)
+          - CLIENT PROFILE (AnavClouds + client info)
+          - CONVERSATION SO FAR (last 3 turns)
+          - CLIENT JUST ASKED (the question)
 
+        Returns cleaned voice-ready text or None on failure.
         Caller is responsible for falling back to Azure synthesis on None.
+
+        Args:
+          user_text: the client's question (verbatim, after STT)
+          project_context: bullet-list of relevant tickets (may be enriched
+                           with fresh Jira data — done at the call site)
+          conversation: recent conversation turns (last 3 used)
+          length: target length hint, default "70-90 words"
+          agenda_block: today's meeting agenda (formatted by caller)
+          client_profile_block: client/company info (formatted by caller)
         """
         import time as _t
         t0 = _t.time()
 
-        # Build conversation hint only if meaningful context exists
-        conversation_hint = ""
+        # Build conversation block — last 3 turns, one per line
         if conversation:
             conv_lines = [l for l in conversation.strip().split("\n") if l.strip()][-3:]
-            if conv_lines:
-                conversation_hint = "Conversation so far:\n" + "\n".join(conv_lines) + "\n\n"
+            conversation_block = "\n".join(conv_lines) if conv_lines else "(start of call)"
+        else:
+            conversation_block = "(start of call)"
 
-        # Build the rich persona query
+        # Defaults so prompt sections don't render as empty/blank
         if not project_context:
             project_context = "- (no specific project context available)"
+        if not agenda_block:
+            agenda_block = "(no fixed agenda for today)"
+        if not client_profile_block:
+            client_profile_block = "(no client profile loaded)"
 
         rich_query = SERPAPI_DIRECT_PROMPT.format(
             question=user_text,
             project_context=project_context,
-            conversation_hint=conversation_hint,
+            agenda_block=agenda_block,
+            client_profile_block=client_profile_block,
+            conversation_block=conversation_block,
             length=length,
         )
 
         try:
             web = self._get_web_search()
-            raw_response = await web.search_raw(rich_query, max_length=2000)
+            # No max_length cap — the structured prompt is built carefully
+            # and Brave AI Mode handles long context well. Truncation was
+            # cutting off the "HOW TO ANSWER" instructions and breaking
+            # response quality.
+            raw_response = await web.search_raw(rich_query, max_length=99999)
             ms = (_t.time() - t0) * 1000
 
             if not raw_response:
@@ -2220,9 +2917,9 @@ class PMAgent:
                         {"role": "system", "content": FILLER_PROMPT.format(question=question)},
                     ],
                     temperature=0.8,
-                    max_tokens=35,
+                    max_tokens=120,  # Bumped from 35 — fits 3-4 sentences (30-50 words)
                 ),
-                timeout=0.4,
+                timeout=1.5,  # Bumped from 1.0s — longer fillers need more Groq time
             )
             text = resp.choices[0].message.content.strip()
             text = text.strip('"').strip("'").strip()
@@ -2234,7 +2931,7 @@ class PMAgent:
                 print(f"[Agent] ⚠️  Dynamic filler rejected ({ms:.0f}ms): \"{text[:60]}\"")
                 return None
         except asyncio.TimeoutError:
-            print(f"[Agent] ⏱ Dynamic filler timeout (>400ms)")
+            print(f"[Agent] ⏱ Dynamic filler timeout (>1500ms)")
             return None
         except asyncio.CancelledError:
             raise
@@ -2244,14 +2941,19 @@ class PMAgent:
 
     @staticmethod
     def _is_valid_filler(text: str) -> bool:
-        """Validate dynamic filler output before using for TTS."""
+        """Validate dynamic filler output before using for TTS.
+
+        Bumped limits for 3-4 sentence fillers (~7s of audio):
+        - char range: 30-350 (was 10-150 for one-sentence fillers)
+        - word range: 8-70 (was 3-30 for one-sentence fillers)
+        """
         if not text or not text.strip():
             return False
         text = text.strip()
-        if len(text) > 150 or len(text) < 10:
+        if len(text) > 350 or len(text) < 30:
             return False
         words = text.split()
-        if len(words) < 3 or len(words) > 30:
+        if len(words) < 8 or len(words) > 70:
             return False
         lower = text.lower()
         bad_phrases = [
@@ -2268,7 +2970,8 @@ class PMAgent:
         checking_signals = [
             "let me", "one sec", "one second", "hold on", "give me",
             "checking", "check", "look", "pull", "see", "think",
-            "find", "grab", "digging", "dig", "moment",
+            "find", "grab", "digging", "dig", "moment", "want to",
+            "make sure", "real quick", "just a", "hang on",
         ]
         if not any(sig in lower for sig in checking_signals):
             return False
@@ -2281,6 +2984,333 @@ class PMAgent:
     def reset(self):
         self.history.clear()
         self.rag.clear()
+
+    async def rewrite_query(self, user_text: str, conversation: str) -> str:
+        """Rewrite a vague user question into a self-contained search query.
+
+        Used for retrieval against the research journal. Runs in parallel
+        with EOT and addressee detector — fired from _handle_addressee_decision.
+
+        Inputs:
+          user_text:    the raw user question
+          conversation: last 5 turns formatted as "Speaker: text" lines
+
+        Returns the rewritten question, or the original on failure (graceful).
+        Latency: ~250-400ms on llama-3.1-8b-instant.
+        """
+        import os as _os
+        import time as _t
+
+        # Runtime kill switch
+        if _os.environ.get("QUERY_REWRITER_ENABLED", "1").strip() == "0":
+            return user_text
+
+        if not user_text or not user_text.strip():
+            return user_text
+
+        prompt = QUERY_REWRITER_PROMPT.format(
+            conversation=conversation or "(start of conversation)",
+            question=user_text.strip(),
+        )
+
+        t0 = _t.time()
+        try:
+            resp = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=80,
+                ),
+                timeout=2.5,  # Stage 2.9: bumped from 1.5 — see warmup below
+            )
+            rewritten = (resp.choices[0].message.content or "").strip()
+            # Strip any surrounding quotes the model sometimes adds
+            for ch in ('"', "'", "“", "”", "‘", "’"):
+                rewritten = rewritten.strip(ch)
+            rewritten = rewritten.strip()
+
+            if not rewritten or len(rewritten) > 300:
+                # Sanity check failed — return raw
+                print(f"[Agent] ⚠️  Rewriter output rejected (len={len(rewritten)}) — using raw")
+                return user_text
+
+            elapsed = (_t.time() - t0) * 1000
+            if rewritten.lower() != user_text.strip().lower():
+                print(f"[Agent] ✏️  Rewrote ({elapsed:.0f}ms): "
+                      f"'{user_text[:40]}' → '{rewritten[:60]}'")
+            else:
+                print(f"[Agent] ✏️  Rewriter: unchanged ({elapsed:.0f}ms)")
+            return rewritten
+
+        except asyncio.TimeoutError:
+            print(f"[Agent] ⚠️  Rewriter timeout (>2.5s) — using raw query")
+            return user_text
+        except Exception as e:
+            print(f"[Agent] ⚠️  Rewriter error ({type(e).__name__}: {e}) — using raw")
+            return user_text
+
+    async def unified_synthesis_to_queue(
+        self,
+        user_text: str,
+        project_context: str,
+        web_results: list,
+        agenda_block: str,
+        client_profile_block: str,
+        conversation: str,
+        memory_context: str,
+        azure_extractor,
+        queue,  # asyncio.Queue
+        length: str = "70-90 words across 4-5 sentences",
+    ):
+        """Stage 2 single-prompt synthesis path for the unified research architecture.
+
+        Reuses RESEARCH_SYNTHESIS_PROMPT (the structured Exa-style template) for
+        ALL question types — feasibility, tech_switch, best_practices, jira_status,
+        internal_org, general. Replaces both stream_research_to_queue (legacy) and
+        exa_stream_synthesis_to_queue (Exa-only) — both become dead code in Stage 4.
+
+        Always-rendered sections (even when empty):
+          - LIVE JIRA TICKETS  (project_context, never blank)
+          - MEETING AGENDA     (agenda_block, never blank)
+          - CLIENT PROFILE     (client_profile_block, never blank — closes the
+                                Tom / Rohan / Apollo CEO hallucination class)
+          - WEB SEARCH RESULTS (web_results=[] renders "(no web search this turn)")
+          - CONVERSATION SO FAR
+
+        memory_context (optional) is prepended to the system prompt.
+
+        Behavior on Azure failure:
+          - 5xx, timeout, transport error → Groq llama-3.3-70b-versatile fallback
+          - Both fail → one-line apology + None to queue. Never raises.
+        """
+        import time as _t
+        import json as _json
+        import httpx as _httpx
+
+        t0 = _t.time()
+
+        # ── Format web_results into a labeled WEB SEARCH RESULTS block ──
+        # Accepts list of dicts {title, url, content, published_date} from
+        # _search_with_fallback (Exa native shape; Brave wrapped to match).
+        if not web_results:
+            web_results_text = "(no web search this turn)"
+        else:
+            lines = []
+            for i, r in enumerate(web_results[:8], 1):
+                title = (r.get("title") or "").strip()
+                content = (r.get("content") or r.get("snippet") or "").strip()
+                published = (r.get("published_date") or "").strip()
+                if not content:
+                    continue
+                line = f"[{i}]"
+                if title:
+                    line += f" {title}"
+                if published:
+                    line += f" ({published})"
+                line += f":\n{content}"
+                lines.append(line)
+            web_results_text = "\n\n".join(lines) if lines else "(no usable web results)"
+
+        # ── Conversation block — last 3 turns ──
+        if conversation:
+            conv_lines = [
+                l for l in conversation.strip().split("\n") if l.strip()
+            ][-3:]
+            conversation_block = "\n".join(conv_lines) if conv_lines else "(start of call)"
+        else:
+            conversation_block = "(start of call)"
+
+        # ── Defaults so prompt sections never render blank ──
+        if not project_context:
+            project_context = "- (no specific project context available)"
+        if not agenda_block:
+            agenda_block = "(no fixed agenda for today)"
+        if not client_profile_block:
+            client_profile_block = "(no client profile loaded)"
+
+        # ── Build the full system prompt ──
+        system = RESEARCH_SYNTHESIS_PROMPT.format(
+            question=user_text,
+            project_context=project_context,
+            agenda_block=agenda_block,
+            client_profile_block=client_profile_block,
+            web_search_results=web_results_text,
+            conversation_block=conversation_block,
+            length=length,
+        )
+
+        # Prepend memory context (from prior meetings) if present
+        if memory_context:
+            system = memory_context + "\n\n" + system
+
+        print(f"[Agent] 🔬 Unified-v2 synthesis prompt: "
+              f"{len(system)} chars (web={len(web_results_text)} chars, "
+              f"profile={len(client_profile_block)} chars, "
+              f"context={len(project_context)} chars)")
+
+        self.history.append({"role": "user", "content": user_text})
+        if len(self.history) > 6:
+            self.history = self.history[-6:]
+
+        # ── Path A: Azure unavailable (disabled or no extractor) → Groq fallback ──
+        azure_unavailable = (not azure_extractor) or (
+            not getattr(azure_extractor, "enabled", False)
+        )
+
+        if azure_unavailable:
+            print("[Agent] ⚠️  Azure unavailable for unified-v2 synthesis — using Groq")
+            await self._stream_groq_synthesis_to_queue(system, user_text, queue)
+            return
+
+        # ── Path B: Azure 4o-mini streaming with Groq 5xx fallback ──
+        url = (
+            f"{azure_extractor.endpoint}/openai/deployments/"
+            f"{azure_extractor.deployment}/chat/completions"
+            f"?api-version={azure_extractor.api_version}"
+        )
+
+        azure_failed = False
+
+        try:
+            async with _httpx.AsyncClient(timeout=60) as client:
+                async with client.stream(
+                    "POST", url,
+                    headers={"api-key": azure_extractor.api_key,
+                             "Content-Type": "application/json"},
+                    json={
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_text},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 250,
+                        "stream": True,
+                    }
+                ) as response:
+
+                    if response.status_code >= 500:
+                        azure_failed = True
+                        print(f"[Agent] ⚠️  Azure {response.status_code} — falling back to Groq")
+                    else:
+                        response.raise_for_status()
+
+                        buffer = ""
+                        full_response = ""
+                        first_token = False
+                        sentence_count = 0
+
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = _json.loads(data)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                token = delta.get("content", "")
+                                if not token:
+                                    continue
+
+                                if not first_token:
+                                    first_token = True
+                                    print(f"[Agent] ⏱ UNIFIED-v2 first token: "
+                                          f"{(_t.time()-t0)*1000:.0f}ms")
+
+                                buffer += token
+                                full_response += token
+
+                                while ". " in buffer or "? " in buffer or "! " in buffer:
+                                    for sep in [". ", "? ", "! "]:
+                                        idx = buffer.find(sep)
+                                        if idx != -1:
+                                            sentence = buffer[:idx + 1].strip()
+                                            buffer = buffer[idx + 2:]
+                                            if sentence:
+                                                sentence_count += 1
+                                                print(f"[Agent] ⏱ UNIFIED-v2 sentence "
+                                                      f"{sentence_count}: "
+                                                      f"{(_t.time()-t0)*1000:.0f}ms")
+                                                await queue.put(sentence)
+                                            break
+                            except (_json.JSONDecodeError, IndexError, KeyError):
+                                continue
+
+                        if buffer.strip():
+                            await queue.put(buffer.strip())
+
+                        self.history.append({"role": "assistant", "content": full_response})
+                        await queue.put(None)
+                        return
+
+        except _httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                azure_failed = True
+                print(f"[Agent] ⚠️  Azure {e.response.status_code} — falling back to Groq")
+            else:
+                print(f"[Agent] ⚠️  Azure {e.response.status_code} — non-retryable")
+                await queue.put("Sorry, I couldn't process that right now.")
+                await queue.put(None)
+                return
+        except (_httpx.TimeoutException, _httpx.TransportError) as e:
+            azure_failed = True
+            print(f"[Agent] ⚠️  Azure transport error — falling back to Groq: "
+                  f"{type(e).__name__}")
+        except __import__("asyncio").CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Agent] ⚠️  Azure unexpected error: {type(e).__name__}: {e}")
+            await queue.put("Sorry, I couldn't process that right now.")
+            await queue.put(None)
+            return
+
+        # ── Groq fallback (Azure failed) ──
+        if azure_failed:
+            await self._stream_groq_synthesis_to_queue(system, user_text, queue)
+
+    async def _stream_groq_synthesis_to_queue(self, system: str, user_text: str, queue):
+        """Groq llama-3.3-70b synthesis fallback used when Azure is down.
+
+        Sentence-streams to the queue. Pushes None when done. Never raises.
+        Used by unified_synthesis_to_queue for both the "Azure disabled" and
+        the "Azure 5xx/transport error" paths.
+        """
+        try:
+            stream = await self.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.7,
+                max_tokens=250,
+                stream=True,
+            )
+            buffer = ""
+            full = ""
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content if chunk.choices else None
+                if not token:
+                    continue
+                buffer += token
+                full += token
+                while ". " in buffer or "? " in buffer or "! " in buffer:
+                    for sep in [". ", "? ", "! "]:
+                        idx = buffer.find(sep)
+                        if idx != -1:
+                            sentence = buffer[:idx + 1].strip()
+                            buffer = buffer[idx + 2:]
+                            if sentence:
+                                await queue.put(sentence)
+                            break
+            if buffer.strip():
+                await queue.put(buffer.strip())
+            self.history.append({"role": "assistant", "content": full})
+        except Exception as e:
+            print(f"[Agent] ⚠️  Groq synthesis fallback failed: {e}")
+            await queue.put("Sorry, I couldn't process that right now.")
+        await queue.put(None)
 
     async def stream_research_to_queue(self, user_text: str, jira_context: str,
                                         related_tickets: str, web_results: str,
