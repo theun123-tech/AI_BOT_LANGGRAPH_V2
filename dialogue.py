@@ -957,6 +957,16 @@ class MeetingState(TypedDict, total=False):
     scope_deviations: Annotated[list[ScopeDeviation], append_list]
     """Log of times user brought up out-of-scope content and how Sam handled it."""
 
+    # ── Client profile (1 field) ───────────────────────────────────────────
+    client_profile: Annotated[str, replace_value]
+    """Free-text client/company profile from the 'Know About Them' UI feature.
+    Used by all synthesis prompts to ground company-fact answers (e.g. who is
+    the CEO, what do we do). Empty string when not configured. Read by:
+    - websocket_server._build_client_profile_block_for_prompt()
+    - Agent._get_client_profile_block()
+    - Agent._format_meeting_state()
+    Set once at DialogueManager.initialize() and unchanged for the session."""
+
     # ── Commitments (3 fields) ─────────────────────────────────────────────
     commitments_open: Annotated[list[Commitment], replace_value]
     """Action items pending. Updated on every turn — use replace to allow removal."""
@@ -1036,11 +1046,17 @@ def create_initial_state(
     prior_meeting_summaries: list[PriorMeetingSummary] | None = None,
     commitments_inherited: list[Commitment] | None = None,
     planned_duration_minutes: int = 30,
+    client_profile: str = "",
 ) -> MeetingState:
     """Build a fully-initialized MeetingState with sensible defaults.
 
-    Use this at session start — it guarantees all 25 fields are present with
+    Use this at session start — it guarantees all 26 fields are present with
     safe defaults so downstream nodes never hit KeyError.
+
+    Args:
+        client_profile: Free-text profile from the "Know About Them" UI feature.
+            Injected into every synthesis prompt so Sam can ground company-fact
+            answers (CEO, services, etc.). Empty string when not configured.
     """
     return MeetingState(
         # Agenda
@@ -1052,6 +1068,8 @@ def create_initial_state(
         scope_in=scope_in or [],
         scope_out=scope_out or [],
         scope_deviations=[],
+        # Client profile (from UI "Know About Them")
+        client_profile=client_profile or "",
         # Commitments
         commitments_open=[],
         commitments_resolved=[],
@@ -1115,6 +1133,8 @@ def state_to_json(state: MeetingState) -> dict:
         "scope_in": list(state.get("scope_in", [])),
         "scope_out": list(state.get("scope_out", [])),
         "scope_deviations": _serialize_list(state.get("scope_deviations", []), lambda x: x.to_dict()),
+        # Client profile (from UI "Know About Them")
+        "client_profile": state.get("client_profile", "") or "",
         # Commitments
         "commitments_open": _serialize_list(state.get("commitments_open", []), lambda x: x.to_dict()),
         "commitments_resolved": _serialize_list(state.get("commitments_resolved", []), lambda x: x.to_dict()),
@@ -1163,6 +1183,8 @@ def state_from_json(data: dict) -> MeetingState:
         scope_in=list(data.get("scope_in", [])),
         scope_out=list(data.get("scope_out", [])),
         scope_deviations=[ScopeDeviation.from_dict(x) for x in data.get("scope_deviations", [])],
+        # Client profile (from UI "Know About Them")
+        client_profile=data.get("client_profile", "") or "",
         # Commitments
         commitments_open=[Commitment.from_dict(x) for x in data.get("commitments_open", [])],
         commitments_resolved=[Commitment.from_dict(x) for x in data.get("commitments_resolved", [])],
@@ -2916,8 +2938,16 @@ class DialogueManager:
         prior_meeting_summaries: Optional[list] = None,
         commitments_inherited: Optional[list] = None,
         planned_duration_minutes: int = 30,
+        client_profile: str = "",
     ) -> None:
-        """Build initial state + compile the LangGraph."""
+        """Build initial state + compile the LangGraph.
+
+        Args:
+            client_profile: Free-text profile from the "Know About Them" UI feature.
+                Stored in MeetingState so all synthesis prompts (legacy research,
+                Exa research, fast PM, fast cached) can ground company-fact answers
+                (CEO name, what we do, etc.). Empty string when not configured.
+        """
         if self._initialized:
             return
 
@@ -2931,6 +2961,7 @@ class DialogueManager:
             prior_meeting_summaries=prior_meeting_summaries or [],
             commitments_inherited=commitments_inherited or [],
             planned_duration_minutes=planned_duration_minutes,
+            client_profile=client_profile or "",
         )
 
         self._graph = self._build_graph()
@@ -2939,9 +2970,11 @@ class DialogueManager:
         agenda_count = len(self._state.get("agenda", []))
         ticket_count = len(self._state.get("pre_loaded_tickets", {}))
         prior_count = len(self._state.get("prior_meeting_summaries", []))
+        cp_len = len(self._state.get("client_profile", "") or "")
 
         print(f"[DialogueManager] {self._tag} 🧠 Initialized "
-              f"(agenda={agenda_count}, tickets={ticket_count}, prior={prior_count})")
+              f"(agenda={agenda_count}, tickets={ticket_count}, "
+              f"prior={prior_count}, client_profile={cp_len} chars)")
 
     def _build_graph(self) -> Any:
         """Construct the LangGraph StateGraph.
